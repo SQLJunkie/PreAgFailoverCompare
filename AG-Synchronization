@@ -56,8 +56,7 @@ function Write-Log {
     $entry | Tee-Object -FilePath $LogFile -Append | Write-Host
 }
 
-# Connect to source first — all pre-flight queries use the connection object to avoid
-# the Microsoft.Data.SqlClient ad-hoc connection DLL conflict.
+# Create connection to Source
 try {
     $Source_SQL_Connection = Connect-DbaInstance -TrustServerCertificate -SqlInstance $Source_Server -ErrorAction Stop
     Write-Log "Connected to $Source_Server."
@@ -67,9 +66,6 @@ catch {
     exit 1
 }
 
-# All pre-flight queries use SMO's ExecuteWithResults() directly on the connection
-# context — this bypasses both Invoke-DbaQuery and Invoke-Sqlcmd entirely, avoiding
-# the Microsoft.Data.SqlClient DLL conflict.
 
 # Check whether the source is the primary replica.
 try {
@@ -418,4 +414,3 @@ else {
 Write-Host ""
 Write-Host "Please review the log file for details:" -ForegroundColor Cyan
 Write-Host "  $LogFile" -ForegroundColor Yellow
-
