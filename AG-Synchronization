@@ -1,0 +1,421 @@
+<#
+.SYNOPSIS
+    Pre-failover synchronization script for SQL Server Availability Groups.
+
+.DESCRIPTION
+    Synchronizes server-level objects from an AG primary replica to its local secondary
+    in preparation for a planned failover.  Designed to be run immediately before failover
+    to minimize drift between replicas.
+
+    Execution order:
+      1. Login sync       — copies missing logins, fixes SID/password hash mismatches,
+                            syncs permissions, and repairs orphaned database users.
+      2. AG object sync   — syncs server-level objects (SpConfigure, ResourceGovernor,
+                            SysDbUserObjects, etc.) via Sync-DbaAvailabilityGroup.
+                            LinkedServers, Credentials, and Agent Jobs are excluded.
+      3. Agent Jobs       — diff-based sync; orphaned jobs removed, new/changed jobs copied.
+      4. SpConfigure diff — report-only comparison; no changes applied.
+
+.PARAMETER Source_Server
+    The SQL Server instance name of the AG primary replica.  Required.
+
+.PARAMETER Ag_Database
+    A database name that is a member of the target Availability Group.  Used to verify
+    primary status and discover the local secondary.  Required.
+
+.PARAMETER Destination_Server
+    The SQL Server instance name of the AG secondary replica.  If omitted, the script
+    queries the primary to auto-discover the local (non-distributed) secondary.
+
+.NOTES
+    Requirements:
+      - PowerShell 5.1+
+      - DBATools module
+      - Caller must have sysadmin on both instances
+      - Log files written to: C:\temp\SynchLogs\
+#>
+param(
+    [Parameter(Mandatory)][string] $Source_Server,
+    [string] $Ag_Database,
+    [string] $Destination_Server = ''
+)
+
+if ([string]::IsNullOrWhiteSpace($Ag_Database)) {
+    throw "The -Ag_Database parameter is required. Please specify a database name."
+}
+
+Import-Module DBATools
+
+Set-DbatoolsInsecureConnection -SessionOnly
+
+$LogFile = "C:\temp\SynchLogs\AG_Sync_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO')
+    $entry = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$Level] $Message"
+    $entry | Tee-Object -FilePath $LogFile -Append | Write-Host
+}
+
+# Connect to source first — all pre-flight queries use the connection object to avoid
+# the Microsoft.Data.SqlClient ad-hoc connection DLL conflict.
+try {
+    $Source_SQL_Connection = Connect-DbaInstance -TrustServerCertificate -SqlInstance $Source_Server -ErrorAction Stop
+    Write-Log "Connected to $Source_Server."
+}
+catch {
+    Write-Log "Failed to connect to $Source_Server. $_" -Level ERROR
+    exit 1
+}
+
+# All pre-flight queries use SMO's ExecuteWithResults() directly on the connection
+# context — this bypasses both Invoke-DbaQuery and Invoke-Sqlcmd entirely, avoiding
+# the Microsoft.Data.SqlClient DLL conflict.
+
+# Check whether the source is the primary replica.
+try {
+    $isPrimaryQuery = "SELECT sys.fn_hadr_is_primary_replica('$($Ag_Database.Replace("'","''"))') AS [is_primary];"
+    $isPrimaryResult = $Source_SQL_Connection.ConnectionContext.ExecuteWithResults($isPrimaryQuery)
+    $isPrimary = $isPrimaryResult.Tables[0].Rows[0]['is_primary']
+}
+catch {
+    Write-Log "Failed to query primary status on $Source_Server. $_" -Level ERROR
+    exit 1
+}
+
+if ($isPrimary -eq $true -or $isPrimary -eq 1) {
+
+    # -------------------------------------------------------------------------
+    # Auto-discover local AG secondary if not supplied
+    # -------------------------------------------------------------------------
+    if (-not $Destination_Server) {
+        $discoverQuery = @"
+SELECT ar.replica_server_name
+FROM   sys.availability_replicas            ar
+JOIN   sys.availability_groups              ag  ON ag.group_id  = ar.group_id
+JOIN   sys.availability_databases_cluster   adc ON adc.group_id = ag.group_id
+JOIN   sys.dm_hadr_availability_replica_states rs ON rs.replica_id = ar.replica_id
+WHERE  ag.is_distributed   = 0
+  AND  adc.database_name   = N'$($Ag_Database.Replace("'","''"))'
+  AND  rs.role             = 2
+  AND  ar.replica_server_name <> @@SERVERNAME;
+"@
+        try {
+            $discoverResult = $Source_SQL_Connection.ConnectionContext.ExecuteWithResults($discoverQuery)
+            $discoveredRows = $discoverResult.Tables[0].Rows
+        }
+        catch {
+            Write-Log "Failed to query AG secondaries on $Source_Server. $_" -Level ERROR
+            exit 1
+        }
+
+        if ($discoveredRows.Count -eq 0) {
+            Write-Log "No local AG secondary found for database '$Ag_Database' on $Source_Server. Aborting." -Level ERROR
+            exit 1
+        }
+        if ($discoveredRows.Count -gt 1) {
+            Write-Log "Multiple local AG secondaries found for '$Ag_Database': $($discoveredRows | ForEach-Object { $_['replica_server_name'] } | Join-String -Separator ', '). Specify -Destination_Server explicitly." -Level ERROR
+            exit 1
+        }
+
+        $Destination_Server = $discoveredRows[0]['replica_server_name']
+        Write-Log "Auto-discovered AG secondary: $Destination_Server"
+    }
+
+    # Connect to destination now that we know the server name.
+    try {
+        $Destination_SQL_Connection = Connect-DbaInstance -TrustServerCertificate -SqlInstance $Destination_Server -ErrorAction Stop
+        Write-Log "Connected to $Source_Server (Primary) and $Destination_Server (Secondary)."
+    }
+    catch {
+        Write-Log "Failed to connect to $Destination_Server. $_" -Level ERROR
+        exit 1
+    }
+
+    # -------------------------------------------------------------------------
+    # Verify sysadmin on both instances before proceeding
+    # -------------------------------------------------------------------------
+    $sysadminQuery = "SELECT IS_SRVROLEMEMBER('sysadmin') AS [is_sysadmin];"
+    foreach ($check in @(
+        @{ Label = $Source_Server;      Connection = $Source_SQL_Connection },
+        @{ Label = $Destination_Server; Connection = $Destination_SQL_Connection }
+    )) {
+        try {
+            $sysResult  = $check.Connection.ConnectionContext.ExecuteWithResults($sysadminQuery)
+            $isSysadmin = $sysResult.Tables[0].Rows[0]['is_sysadmin']
+            if ($isSysadmin -ne $true -and $isSysadmin -ne 1) {
+                Write-Log "Account does not have sysadmin on $($check.Label). Aborting." -Level ERROR
+                exit 1
+            }
+            Write-Log "Sysadmin confirmed on $($check.Label)."
+        }
+        catch {
+            Write-Log "Failed to verify sysadmin on $($check.Label). $_" -Level ERROR
+            exit 1
+        }
+    }
+
+    # Suppress DAC connection attempts — SQL Browser not required
+    Set-DbatoolsConfig -FullName sql.connection.dacportdiscovery -Value $false
+
+    # -------------------------------------------------------------------------
+    # 1. Login sync — copy missing logins; sync SID/password mismatches
+    #    Logins are the foundation — agent job owners, permissions, and server
+    #    objects all reference them, so they must be in place first.
+    # -------------------------------------------------------------------------
+    try {
+        Write-Log "Syncing logins..."
+
+        $sourceLogins = Get-DbaLogin -SqlInstance $Source_SQL_Connection | Where-Object { $_.Name -notlike '##*' -and $_.Name -ne 'sa' }
+        $destLogins   = Get-DbaLogin -SqlInstance $Destination_SQL_Connection | Where-Object { $_.Name -notlike '##*' -and $_.Name -ne 'sa' }
+        $destLoginMap  = @{}
+        $destLogins | ForEach-Object { $destLoginMap[$_.Name] = $_ }
+
+        $missing  = $sourceLogins | Where-Object { -not $destLoginMap.ContainsKey($_.Name) }
+        $existing = $sourceLogins | Where-Object {  $destLoginMap.ContainsKey($_.Name) }
+
+        # Classify destination databases once — reused by mismatch sync, orphan repair, and
+        # permission sync below.  IsUpdateable = $false covers restoring databases AND AG
+        # secondary databases (Online but read-only).
+        $allDestDbs  = Get-DbaDatabase -SqlInstance $Destination_SQL_Connection
+        $excludeDbs  = $allDestDbs | Where-Object { -not $_.IsUpdateable } | Select-Object -ExpandProperty Name
+        $writableDbs = $allDestDbs | Where-Object {  $_.IsUpdateable      } | Select-Object -ExpandProperty Name
+
+        if ($writableDbs) {
+            Write-Log "$($writableDbs.Count) local writable database(s) available for login operations:"
+            $writableDbs | ForEach-Object { Write-Log "  - $_" }
+        }
+        else {
+            Write-Log "No local writable databases found on $Destination_Server." -Level WARN
+        }
+
+        if ($missing) {
+            Write-Log "Copying $($missing.Count) missing login(s)..."
+            Copy-DbaLogin -Source $Source_SQL_Connection -Destination $Destination_SQL_Connection `
+                -Login $missing.Name -SyncSaName -ErrorAction Stop | Out-Null
+        }
+
+        # Bulk-fetch SID and password_hash for all SQL logins on both instances in two
+        # queries — avoids per-login SMO property round-trips which are very slow at scale.
+        $loginDataQuery = "SELECT name, sid, password_hash FROM sys.sql_logins WHERE name NOT LIKE '##%' AND name <> 'sa';"
+        $srcLoginData   = @{}
+        $dstLoginData   = @{}
+        $Source_SQL_Connection.ConnectionContext.ExecuteWithResults($loginDataQuery).Tables[0].Rows |
+            ForEach-Object { $srcLoginData[$_['name']] = $_ }
+        $Destination_SQL_Connection.ConnectionContext.ExecuteWithResults($loginDataQuery).Tables[0].Rows |
+            ForEach-Object { $dstLoginData[$_['name']] = $_ }
+
+        # Sync SID and password hash on existing SQL logins where there is a mismatch.
+        # -Force is required — without it Copy-DbaLogin skips logins that already exist
+        # on the destination and the mismatch is never actually resolved.
+        # Copy-DbaLogin has no database filtering parameter — it internally calls Update-SqlPermission
+        # against all databases.  We suppress those warnings for known non-writable databases and
+        # log anything unexpected.
+        $repairedLogins = [System.Collections.Generic.List[string]]::new()
+        foreach ($src in ($existing | Where-Object { $_.LoginType -eq 'SqlLogin' })) {
+            $srcRow = $srcLoginData[$src.Name]
+            $dstRow = $dstLoginData[$src.Name]
+
+            # Skip if no bulk data found for either side (e.g. Windows logins filtered out)
+            if (-not $srcRow -or -not $dstRow) { continue }
+
+            $srcSid  = if ($null -ne $srcRow['sid'])           { [System.BitConverter]::ToString($srcRow['sid']) }           else { '' }
+            $dstSid  = if ($null -ne $dstRow['sid'])           { [System.BitConverter]::ToString($dstRow['sid']) }           else { '' }
+            $srcHash = if ($null -ne $srcRow['password_hash']) { [System.BitConverter]::ToString($srcRow['password_hash']) } else { '' }
+            $dstHash = if ($null -ne $dstRow['password_hash']) { [System.BitConverter]::ToString($dstRow['password_hash']) } else { '' }
+
+            $sidMismatch  = $srcSid  -ne $dstSid
+            $hashMismatch = $srcHash -ne $dstHash
+
+            if ($sidMismatch -or $hashMismatch) {
+                Write-Log "  Syncing login '$($src.Name)' (SID or password hash mismatch)..." -Level WARN
+                Copy-DbaLogin -Source $Source_SQL_Connection -Destination $Destination_SQL_Connection `
+                    -Login $src.Name -SyncSaName -Force -ErrorAction Stop `
+                    -WarningAction SilentlyContinue -WarningVariable loginCopyWarnings | Out-Null
+
+                # Log any warnings that are NOT about known non-writable databases.
+                $loginCopyWarnings |
+                    Where-Object { $msg = "$_"; -not ($excludeDbs | Where-Object { $msg -match $_ }) } |
+                    ForEach-Object { Write-Log "  [WARNING] Login '$($src.Name)': $_" -Level WARN }
+
+                $repairedLogins.Add($src.Name)
+            }
+        }
+
+        # Repair any orphaned database users caused by drop/recreate of logins above.
+        # Scoped to writable databases only — AG secondaries cannot be updated.
+        if ($repairedLogins.Count -gt 0 -and $writableDbs) {
+            Write-Log "  Checking for orphaned users in writable databases after login sync..."
+            $repaired = Repair-DbaDbOrphanUser -SqlInstance $Destination_SQL_Connection `
+                -Database $writableDbs -ErrorAction SilentlyContinue
+            if ($repaired) {
+                $repaired | ForEach-Object {
+                    Write-Log "  Repaired orphaned user '$($_.UserName)' in database '$($_.DatabaseName)'"
+                }
+            }
+            else {
+                Write-Log "  No orphaned users found."
+            }
+        }
+
+        # Only sync permissions for logins that were actually added or modified this run.
+        # Syncing all logins every run is expensive — it checks every login against every
+        # writable database even when nothing has changed.
+        # Sync-DbaLoginPermission has no -Database/-ExcludeDatabase in this version of DBATools;
+        # warnings about non-writable databases are expected and suppressed.
+        $loginsToSync = @(($missing | Select-Object -ExpandProperty Name) + $repairedLogins) | Select-Object -Unique
+        if ($loginsToSync.Count -gt 0) {
+            Write-Log "Syncing permissions for $($loginsToSync.Count) added/modified login(s)..."
+            Sync-DbaLoginPermission -Source $Source_SQL_Connection -Destination $Destination_SQL_Connection `
+                -Login $loginsToSync -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
+        }
+        else {
+            Write-Log "No login changes detected — skipping permission sync."
+        }
+        Write-Log "Login sync completed."
+    }
+    catch {
+        Write-Log "Login sync failed. $_" -Level ERROR
+        exit 1
+    }
+
+    # -------------------------------------------------------------------------
+    # 2. Sync AG server-level objects — logins are now in place so operator,
+    #    proxy, and other login-referencing objects will resolve correctly.
+    #    LinkedServers and Credentials excluded intentionally.
+    #    AgentJob/AgentSchedule excluded here; jobs handled separately below.
+    # -------------------------------------------------------------------------
+    try {
+        Write-Log "Starting Sync-DbaAvailabilityGroup..."
+        Sync-DbaAvailabilityGroup `
+            -Primary   $Source_SQL_Connection `
+            -Secondary $Destination_SQL_Connection `
+            -Exclude   CustomErrors, DatabaseMail, AgentCategory, AgentOperator, AgentAlert,
+                       AgentProxy, AgentJob, AgentSchedule, LoginPermissions,
+                       LinkedServers, Credentials `
+            -ErrorAction Stop | Out-Null
+        Write-Log "Sync-DbaAvailabilityGroup completed."
+    }
+    catch {
+        Write-Log "Sync-DbaAvailabilityGroup failed. $_" -Level ERROR
+        exit 1
+    }
+
+    # -------------------------------------------------------------------------
+    # 3. Agent Jobs — diff-based sync: remove orphans, copy only new/changed jobs
+    #    Comparison is based on DateLastModified at the job level; SQL Server
+    #    updates this timestamp when any job step is modified as well.
+    # -------------------------------------------------------------------------
+    try {
+        Write-Log "Starting Agent Job diff sync between $Source_Server and $Destination_Server..."
+
+        $sourceJobs = Get-DbaAgentJob -SqlInstance $Source_SQL_Connection
+        $destJobs   = Get-DbaAgentJob -SqlInstance $Destination_SQL_Connection
+
+        $sourceJobMap = @{}
+        $sourceJobs | ForEach-Object { $sourceJobMap[$_.Name] = $_ }
+
+        $destJobMap = @{}
+        $destJobs   | ForEach-Object { $destJobMap[$_.Name] = $_ }
+
+        # --- Remove jobs that exist on destination but not on source ---
+        $orphanJobs = $destJobs | Where-Object { -not $sourceJobMap.ContainsKey($_.Name) }
+        if ($orphanJobs) {
+            Write-Log "$($orphanJobs.Count) orphan job(s) found on destination (not present on source) — removing:"
+            $currentLogin = $Destination_SQL_Connection.ConnectionContext.TrueLogin
+            foreach ($job in $orphanJobs) {
+                try {
+                    # Take ownership first — SMO blocks delete on jobs owned by a different login
+                    $job.OwnerLoginName = $currentLogin
+                    $job.Alter()
+                    $job | Remove-DbaAgentJob -Confirm:$false -ErrorAction Stop
+                    Write-Log "  Removed orphan job: '$($job.Name)'"
+                }
+                catch {
+                    Write-Log "  Could not remove orphan job '$($job.Name)': $_" -Level WARN
+                }
+            }
+        }
+        else {
+            Write-Log "No orphan jobs found on destination."
+        }
+
+        # --- Copy jobs that are new or changed ---
+        $jobsToCopy = $sourceJobs | Where-Object {
+            $destJob = $destJobMap[$_.Name]
+            # New job — does not exist on destination
+            if (-not $destJob) { return $true }
+            # Changed job — source is newer than destination.
+            # Using -gt rather than -ne because Copy-DbaAgentJob -DisableOnDestination
+            # updates DateLastModified on the destination after every copy, which would
+            # cause -ne to flag every job as changed on subsequent runs.
+            return $_.DateLastModified -gt $destJob.DateLastModified
+        }
+
+        if ($jobsToCopy) {
+            Write-Log "$($jobsToCopy.Count) job(s) to copy (new or changed):"
+            foreach ($job in $jobsToCopy) {
+                $reason = if (-not $destJobMap.ContainsKey($job.Name)) { 'new' } else { 'changed' }
+                Write-Log "  Copying job '$($job.Name)' ($reason)..."
+                try {
+                    # -WarningAction SilentlyContinue suppresses the known DBATools false positive:
+                    # "Cannot convert Microsoft.Data.SqlClient.SqlConnection to SqlConnection"
+                    # This is a DLL version conflict between DBATools and the SqlServer module.
+                    # Jobs copy successfully despite the warning — it is safe to suppress entirely.
+                    Copy-DbaAgentJob -Source $Source_SQL_Connection -Destination $Destination_SQL_Connection `
+                        -Job $job.Name -DisableOnDestination -Force -ErrorAction Stop `
+                        -WarningAction SilentlyContinue | Out-Null
+                }
+                catch {
+                    Write-Log "  Failed to copy job '$($job.Name)': $_" -Level ERROR
+                }
+            }
+            Write-Log "Agent Job copy complete."
+        }
+        else {
+            Write-Log "All Agent Jobs are already in sync — no changes to copy."
+        }
+    }
+    catch {
+        Write-Log "Agent Job sync failed. $_" -Level ERROR
+        exit 1
+    }
+
+    # -------------------------------------------------------------------------
+    # 4. SpConfigure compare — report only, no changes applied
+    #    Runs last as a health-check summary of any remaining server config drift.
+    # -------------------------------------------------------------------------
+    try {
+        Write-Log "Comparing SpConfigure between $Source_Server and $Destination_Server..."
+        $spDiff = Compare-Object `
+            -ReferenceObject  (Get-DbaSpConfigure -SqlInstance $Source_SQL_Connection) `
+            -DifferenceObject (Get-DbaSpConfigure -SqlInstance $Destination_SQL_Connection) `
+            -Property Name, ConfiguredValue `
+            -PassThru |
+            Where-Object { $_.SideIndicator -ne '==' }
+
+        if ($spDiff) {
+            Write-Log "SpConfigure differences found:" -Level WARN
+            $spDiff | ForEach-Object {
+                $side = if ($_.SideIndicator -eq '<=') { $Source_Server } else { $Destination_Server }
+                Write-Log "  [$side] $($_.Name) = $($_.ConfiguredValue)" -Level WARN
+            }
+        }
+        else {
+            Write-Log "SpConfigure: no differences found."
+        }
+    }
+    catch {
+        Write-Log "SpConfigure comparison failed. $_" -Level ERROR
+        # Non-fatal — continue
+    }
+
+    Write-Log "AG pre-failover sync completed successfully."
+}
+else {
+    Write-Log "$Source_Server is not the Primary replica. No sync performed." -Level WARN
+}
+
+Write-Host ""
+Write-Host "Please review the log file for details:" -ForegroundColor Cyan
+Write-Host "  $LogFile" -ForegroundColor Yellow
+
